@@ -12,6 +12,7 @@ import (
 	"time"
 
 	extflag "github.com/efficientgo/tools/extkingpin"
+	"github.com/kevindweb/throttle-proxy/proxymw"
 	"google.golang.org/grpc"
 
 	"github.com/go-kit/log"
@@ -241,7 +242,17 @@ func registerQuery(app *extkingpin.App) {
 	var storeRateLimits store.SeriesSelectLimits
 	storeRateLimits.RegisterFlags(cmd)
 
+	var throttleConfig proxymw.Config
+	throttleConfigParseErr := registerProxyFlags(&throttleConfig, cmd)
+
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, debugLogging bool) error {
+		if throttleConfigParseErr != nil {
+			return throttleConfigParseErr
+		}
+		if err := throttleConfig.Validate(); err != nil {
+			return errors.Wrap(err, "error validating query throttling config")
+		}
+
 		selectorLset, err := parseFlagLabels(*selectorLabels)
 		if err != nil {
 			return errors.Wrap(err, "parse federation labels")
@@ -360,6 +371,7 @@ func registerQuery(app *extkingpin.App) {
 			*strictEndpoints,
 			*strictEndpointGroups,
 			*webDisableCORS,
+			throttleConfig,
 			*alertQueryURL,
 			*grpcProxyStrategy,
 			*queryTelemetryDurationQuantiles,
@@ -378,6 +390,31 @@ func registerQuery(app *extkingpin.App) {
 			*queryDistributedWithOverlappingInterval,
 		)
 	})
+}
+
+func registerProxyFlags(cfg *proxymw.Config, cmd extkingpin.FlagClause) error {
+	cfg.ClientTimeout = time.Duration(*extkingpin.ModelDuration(cmd.Flag("query-proxy-timeout", "Proxy read timeout to cleanup backpressure signals").Default("0ms")))
+	cfg.EnableJitter = *cmd.Flag("enable-query-jitter", "Use the jitter query throttling middleware").Default("false").Bool()
+	cfg.JitterDelay = time.Duration(*extkingpin.ModelDuration(cmd.Flag("query-jitter-delay", "Random jitter to apply to each query when enabled").Default("0ms")))
+	cfg.EnableObserver = *cmd.Flag("enable-query-observer", "Collect middleware latency and error metrics").Default("false").Bool()
+	cfg.EnableCriticality = *cmd.Flag("enable-query-criticality", "Read query criticality headers").Default("false").Bool()
+	bp := &cfg.BackpressureConfig
+	bp.EnableBackpressure = *cmd.Flag("enable-query-backpressure", "Apply adaptive query throttling using backpressure metrics").Default("false").Bool()
+	bp.CongestionWindowMin = *cmd.Flag("query-backpressure-cwnd-min", "Min concurrent queries to passthrough regardless of spikes in backpressure").Default("0").Int()
+	bp.CongestionWindowMax = *cmd.Flag("query-backpressure-cwnd-max", "Max concurrent queries to passthrough regardless of backpressure health").Default("0").Int()
+	bp.BackpressureMonitoringURL = *cmd.Flag("query-backpressure-monitoring-url", "The address on which to read backpressure metrics with PromQL queries").Default("").String()
+
+	bpQueries := *cmd.Flag("backpressure-query", "PromQL that signifies an increase in downstream resource consumption").Default("").Strings()
+	bpQueryNames := *cmd.Flag("backpressure-query-name",
+		"Name is an optional human readable field used to emit tagged metrics. "+
+			"When unset, operational metrics are omitted. "+
+			`When set, read warn_threshold as proxymw_bp_warn_threshold{query_name="<name>"}`).Default("").Strings()
+	bpWarnThresholds := *cmd.Flag("backpressure-query-warn", "Threshold that defines when the system should start backing off").Default("").Float64List()
+	bpEmergencyThresholds := *cmd.Flag("backpressure-query-emergency", "Threshold that defines when the system should apply maximum throttling").Default("").Float64List()
+
+	var err error
+	cfg.BackpressureQueries, err = proxymw.ParseBackpressureQueries(bpQueries, bpQueryNames, bpWarnThresholds, bpEmergencyThresholds)
+	return err
 }
 
 // runQuery starts a server that exposes PromQL Query API. It is responsible for querying configured
@@ -443,6 +480,7 @@ func runQuery(
 	strictEndpoints []string,
 	strictEndpointGroups []string,
 	disableCORS bool,
+	throttleConfig proxymw.Config,
 	alertQueryURL string,
 	grpcProxyStrategy string,
 	queryTelemetryDurationQuantiles []float64,
@@ -761,6 +799,7 @@ func runQuery(
 			instantDefaultMaxSourceResolution,
 			defaultMetadataTimeRange,
 			disableCORS,
+			throttleConfig,
 			gate.New(
 				extprom.WrapRegistererWithPrefix("thanos_query_concurrent_", reg),
 				maxConcurrentQueries,

@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/kevindweb/throttle-proxy/proxymw"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -189,6 +190,8 @@ type QueryAPI struct {
 	enableExemplarPartialResponse       bool
 	disableCORS                         bool
 
+	throttleConfig proxymw.Config
+
 	replicaLabels  []string
 	endpointStatus func() []query.EndpointStatus
 
@@ -231,6 +234,7 @@ func NewQueryAPI(
 	defaultInstantQueryMaxSourceResolution time.Duration,
 	defaultMetadataTimeRange time.Duration,
 	disableCORS bool,
+	throttleConfig proxymw.Config,
 	gate gate.Gate,
 	statsAggregatorFactory store.SeriesQueryPerformanceMetricsAggregatorFactory,
 	reg *prometheus.Registry,
@@ -288,14 +292,16 @@ func (qapi *QueryAPI) Register(r *route.Router, tracer opentracing.Tracer, logge
 
 	instr := api.GetInstr(tracer, logger, ins, logMiddleware, qapi.disableCORS)
 
-	r.Get("/query", instr("query", qapi.query))
-	r.Post("/query", instr("query", qapi.query))
+	queryFunc := proxymw.NewServeFuncFromConfig(qapi.throttleConfig, instr("query", qapi.query))
+	r.Get("/query", queryFunc)
+	r.Post("/query", queryFunc)
 
 	r.Get("/query_explain", instr("query", qapi.queryExplain))
 	r.Post("/query_explain", instr("query", qapi.queryExplain))
 
-	r.Get("/query_range", instr("query_range", qapi.queryRange))
-	r.Post("/query_range", instr("query_range", qapi.queryRange))
+	queryRangeFunc := proxymw.NewServeFuncFromConfig(qapi.throttleConfig, instr("query_range", qapi.queryRange))
+	r.Get("/query_range", queryRangeFunc)
+	r.Post("/query_range", queryRangeFunc)
 
 	r.Get("/query_range_explain", instr("query", qapi.queryRangeExplain))
 	r.Post("/query_range_explain", instr("query", qapi.queryRangeExplain))
